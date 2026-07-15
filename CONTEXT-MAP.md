@@ -6,7 +6,7 @@ This repo houses multiple independent, general-purpose C# projects (see [ADR 000
 | --- | --- | --- |
 | Ingestion Engine | Generic folder-walking + pluggable-extraction framework | `IngestionEngine/CONTEXT.md` (not yet written) |
 | Pipeline Builder | Generic composable pipeline/stage framework | `PipelineBuilder/CONTEXT.md` (not yet written) |
-| Graph Library | Generic graph data structure + query/rule-evaluation library | `GraphLibrary/CONTEXT.md` (not yet written) |
+| Graph Library | Generic graph data structure + query/rule-evaluation library | [`GraphLibrary/CONTEXT.md`](GraphLibrary/CONTEXT.md) |
 | Catalog | Domain layer: distributions, products, containment/configuration rules | `Catalog/CONTEXT.md` (not yet written) |
 
 Each `CONTEXT.md` is written lazily, as that project's own spec effort resolves its terms and decisions (see `/domain-modeling`).
