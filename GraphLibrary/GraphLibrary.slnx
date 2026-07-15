@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GraphLibrary/GraphLibrary.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GraphLibrary.Tests/GraphLibrary.Tests.csproj" />
+  </Folder>
+</Solution>
