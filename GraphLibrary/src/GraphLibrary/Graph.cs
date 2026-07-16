@@ -29,7 +29,30 @@ namespace GraphLibrary;
 /// </para>
 /// <para>
 /// Reads are pure — no member below performs lazy mutation or memoization — which is load-bearing
-/// for the concurrent-read guarantee a later ticket relies on.
+/// for the concurrent-read guarantee this type's contract relies on.
+/// </para>
+/// <para>
+/// <b>Concurrency &amp; liveness contract</b> (ticket #17, spec stories 78–84). This type is
+/// <b>caller-synchronized, not internally thread-safe</b>, following the BCL base-collection
+/// convention (<c>List&lt;T&gt;</c>, <c>Dictionary&lt;TKey,TValue&gt;</c>): there is no internal
+/// locking, so the single-threaded hot path pays zero synchronization overhead. Concurrent
+/// <em>writes</em> require external synchronization by the caller. Concurrent <em>reads are safe as
+/// long as no writer is active</em> — the same guarantee the BCL makes, holding here because all
+/// index/derived-state maintenance sits on the write path and reads stay pure (a graph must cross a
+/// proper synchronization boundary before concurrent reads begin — the standard safe-publication
+/// caveat). A single monotonic structural-version counter, bumped on every node/edge add and every
+/// removal that actually removed something, makes <em>every</em> enumeration and traversal fail fast
+/// with <see cref="InvalidOperationException"/> when the graph is structurally mutated mid-iteration
+/// — uniformly across the whole API, not only lazy traversal. In-place
+/// <see cref="SetPayload(NodeHandle,TNode)"/> / <see cref="SetPayload(EdgeHandle,TEdge)"/> is
+/// structural-<em>only</em> exempt: it does not bump the counter (matching BCL indexer-set
+/// semantics), so updating payload during enumeration is never spuriously rejected — payload-content
+/// changes are observed instead via <see cref="NodePayloadChanged"/> / <see cref="EdgePayloadChanged"/>.
+/// The fail-fast check is a <b>best-effort debugging aid</b> for the "forgot to synchronize" bug —
+/// <em>not</em> a memory barrier and <em>not</em> a thread-safety guarantee; a genuine data race can
+/// slip past it. A future true-thread-safe variant is deliberately left to a separate purpose-built
+/// type (lock-striping / copy-on-write snapshot / persistent-immutable sibling), never a lock wrapper
+/// over this core — which is why the core carries no lock to remove.
 /// </para>
 /// </remarks>
 public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
@@ -52,6 +75,17 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     private EdgeSlot[] _edges = new EdgeSlot[InitialCapacity];
     private int _edgeHighWater;
     private readonly Stack<int> _freeEdgeSlots = new();
+
+    // Single monotonic structural-version counter (ticket #17 / spec stories 78–84). Bumped by
+    // every mutation that changes graph *structure* — a node/edge add, or a removal that actually
+    // removed something — and by nothing else. In particular an in-place SetPayload does NOT bump
+    // it (matching BCL indexer-set semantics, story 81) and a no-op idempotent removal does not
+    // either. Every lazy enumeration below snapshots it and re-checks on each step, so a structural
+    // mutation mid-iteration fails fast uniformly across the whole read surface (story 80). This is
+    // a best-effort debugging aid for the "forgot to synchronize" bug — not a memory barrier and
+    // not thread-safety (story 82); it is a plain int, deliberately un-Interlocked, because the
+    // contract is caller-synchronized writes (story 78).
+    private int _structuralVersion;
 
     private const int InitialCapacity = 4;
 
@@ -114,6 +148,7 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         slot.Alive = true;
         slot.OutEdges.Clear();
         slot.InEdges.Clear();
+        _structuralVersion++;
         return new NodeHandle(index, slot.Generation, _graphId);
     }
 
@@ -154,6 +189,7 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         _nodes[sourceIndex].OutEdges.Add(index);
         _nodes[targetIndex].InEdges.Add(index);
 
+        _structuralVersion++;
         return new EdgeHandle(index, slot.Generation, _graphId);
     }
 
@@ -227,6 +263,9 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         slot.OutEdges.Clear();
         slot.InEdges.Clear();
         _freeNodeSlots.Push(index);
+        // One bump for the whole removal (the node and any swept edges) — the counter only needs
+        // to move once to invalidate a live enumeration; RetractEdge deliberately does not bump.
+        _structuralVersion++;
         return true;
     }
 
@@ -246,6 +285,7 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         }
 
         RetractEdge(handle.Index);
+        _structuralVersion++;
         return true;
     }
 
@@ -268,8 +308,15 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     {
         get
         {
+            // Snapshot the structural version when enumeration begins (first MoveNext, since this is
+            // an iterator) and re-check each step: a node/edge add or remove mid-walk fails fast.
+            int version = _structuralVersion;
             for (int i = 0; i < _nodeHighWater; i++)
             {
+                if (version != _structuralVersion)
+                {
+                    throw StructurallyModified();
+                }
                 if (_nodes[i].Alive)
                 {
                     yield return new NodeHandle(i, _nodes[i].Generation, _graphId);
@@ -283,8 +330,13 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     {
         get
         {
+            int version = _structuralVersion;
             for (int i = 0; i < _edgeHighWater; i++)
             {
+                if (version != _structuralVersion)
+                {
+                    throw StructurallyModified();
+                }
                 if (_edges[i].Alive)
                 {
                     yield return new EdgeHandle(i, _edges[i].Generation, _graphId);
@@ -316,9 +368,34 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     private IEnumerable<EdgeHandle> IncidenceOf(int index, bool outgoing)
     {
         List<int> edges = outgoing ? _nodes[index].OutEdges : _nodes[index].InEdges;
-        foreach (int edgeIndex in edges)
+        foreach (int edgeIndex in WalkIncidence(edges))
         {
             yield return new EdgeHandle(edgeIndex, _edges[edgeIndex].Generation, _graphId);
+        }
+    }
+
+    // Walks an incidence list index-by-index under the structural-version guard, yielding raw
+    // edge-store indices for callers to project or filter. The version is snapshotted when the walk
+    // begins and re-checked *before* the bounds test each step (the order the BCL enumerator uses):
+    // any structural mutation makes the walk fail fast with our uniform exception — for a change
+    // anywhere in the graph, not only one touching this list, and before the List's own versioning
+    // could throw a different, non-uniform exception — and a removal that shrinks this very list
+    // fails fast rather than quietly ending because the count dropped out from under it. Centralised
+    // so the two incidence readers below can't drift on this subtle ordering.
+    private IEnumerable<int> WalkIncidence(List<int> edgeIds)
+    {
+        int version = _structuralVersion;
+        for (int i = 0; ; i++)
+        {
+            if (version != _structuralVersion)
+            {
+                throw StructurallyModified();
+            }
+            if (i >= edgeIds.Count)
+            {
+                yield break;
+            }
+            yield return edgeIds[i];
         }
     }
 
@@ -335,7 +412,7 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
 
     private IEnumerable<EdgeHandle> EdgesBetween(int sourceIndex, NodeHandle target)
     {
-        foreach (int edgeIndex in _nodes[sourceIndex].OutEdges)
+        foreach (int edgeIndex in WalkIncidence(_nodes[sourceIndex].OutEdges))
         {
             if (_edges[edgeIndex].Target == target)
             {
@@ -392,6 +469,39 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
             && _edges[index].Alive
             && _edges[index].Generation == handle.Generation;
     }
+
+    // Non-throwing counterpart of Resolve, used on the SetPayload path where a stale or cross-graph
+    // handle is a silent no-op rather than an error (ADR 0003, spec story 10): it folds the
+    // cross-graph and liveness tests into one bool so payload updates never throw. `index` is
+    // meaningful only when the method returns true.
+    private bool TryResolve(NodeHandle handle, out int index)
+    {
+        if (handle.GraphId == _graphId && IsLiveNode(handle))
+        {
+            index = handle.Index;
+            return true;
+        }
+        index = default;
+        return false;
+    }
+
+    private bool TryResolve(EdgeHandle handle, out int index)
+    {
+        if (handle.GraphId == _graphId && IsLiveEdge(handle))
+        {
+            index = handle.Index;
+            return true;
+        }
+        index = default;
+        return false;
+    }
+
+    // The uniform mid-iteration failure (spec story 80), mirroring the BCL's wording for a
+    // collection mutated during enumeration. Best-effort: it is raised on the enumerating thread
+    // when it observes the counter has moved, not a cross-thread safety guarantee (story 82).
+    private static InvalidOperationException StructurallyModified() =>
+        new("The graph was structurally modified; enumeration may not continue. "
+            + "Reads are caller-synchronized — synchronize your writes against concurrent reads.");
 
     // A default/uninitialised handle carries graph id 0; real graph ids start at 1, so it is
     // rejected here as not belonging to this graph.
