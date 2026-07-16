@@ -10,11 +10,14 @@ namespace GraphLibrary;
 /// </summary>
 /// <remarks>
 /// <para>
-/// This slice (#13, on top of #12's add &amp; read) makes the graph mutable-consistent:
+/// #13 (on top of #12's add &amp; read) made the graph mutable-consistent:
 /// <see cref="RemoveNode"/> sweeps a node and every incident edge, <see cref="RemoveEdge"/>
 /// retracts one edge and leaves its endpoints, and per-node in/out incidence indices make both
-/// traversal directions and degree cheap. Handle guards, payload mutation, validators, and the
-/// fluent builder arrive in later tickets.
+/// traversal directions and degree cheap. This slice (#14) adds the runtime handle guard: every
+/// handle-consuming member resolves through the generation/graph stamp, so a handle from another
+/// graph or one whose element was removed throws <see cref="InvalidHandleException"/> (ADR 0003)
+/// instead of aliasing the wrong slot. Payload mutation, validators, and the fluent builder arrive
+/// in later tickets.
 /// </para>
 /// <para>
 /// Backing is a generational-index slot-map (ADR 0002): a node store carrying payload plus its
@@ -31,9 +34,10 @@ namespace GraphLibrary;
 /// </remarks>
 public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
 {
-    // Distinct id per graph instance, stamped into every handle this graph mints so a later
-    // ticket can reject a handle used against the wrong graph. Interlocked keeps ids unique
-    // even if graphs are constructed concurrently (construction itself needs no other sync).
+    // Distinct id per graph instance, stamped into every handle this graph mints so RequireOwnGraph
+    // can reject a handle used against the wrong graph. Starts at 1 (Interlocked.Increment from 0),
+    // so a default handle's id of 0 never matches a real graph. Interlocked keeps ids unique even if
+    // graphs are constructed concurrently (construction itself needs no other sync).
     private static int _nextGraphId;
 
     private readonly int _graphId = System.Threading.Interlocked.Increment(ref _nextGraphId);
@@ -106,6 +110,11 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     /// </summary>
     public EdgeHandle AddEdge(NodeHandle source, NodeHandle target, TEdge payload)
     {
+        // Endpoints must be live handles of this graph — a cross-graph or stale endpoint would
+        // otherwise corrupt incidence by aliasing an unrelated (or freed) slot. Fail fast (ADR 0003).
+        int sourceIndex = Resolve(source);
+        int targetIndex = Resolve(target);
+
         int index;
         if (_freeEdgeSlots.Count > 0)
         {
@@ -127,8 +136,8 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         slot.Target = target;
 
         // Register incidence on both endpoints; a self-loop lands in both lists of the one node.
-        _nodes[source.Index].OutEdges.Add(index);
-        _nodes[target.Index].InEdges.Add(index);
+        _nodes[sourceIndex].OutEdges.Add(index);
+        _nodes[targetIndex].InEdges.Add(index);
 
         return new EdgeHandle(index, slot.Generation, _graphId);
     }
@@ -140,11 +149,15 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     /// </summary>
     public bool RemoveNode(NodeHandle handle)
     {
-        if (!TryResolve(handle, out int index))
+        // A handle from another graph is unambiguous misuse, not "already removed" — throw. A stale
+        // same-graph handle, though, means the node is genuinely gone, so removal stays idempotent.
+        RequireOwnGraph(handle.GraphId, "node");
+        if (!IsLiveNode(handle))
         {
             return false;
         }
 
+        int index = handle.Index;
         ref NodeSlot slot = ref _nodes[index];
 
         // Snapshot the incident edges before retracting any — retraction mutates these lists, and
@@ -170,12 +183,15 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     /// </summary>
     public bool RemoveEdge(EdgeHandle handle)
     {
-        if (!TryResolve(handle, out int index))
+        // Same posture as RemoveNode: cross-graph misuse throws, a stale same-graph handle is
+        // idempotent (the edge — including one swept by a node removal — is genuinely gone).
+        RequireOwnGraph(handle.GraphId, "edge");
+        if (!IsLiveEdge(handle))
         {
             return false;
         }
 
-        RetractEdge(index);
+        RetractEdge(handle.Index);
         return true;
     }
 
@@ -224,30 +240,27 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     }
 
     /// <inheritdoc/>
-    public TNode GetNodePayload(NodeHandle handle) => _nodes[handle.Index].Payload;
+    public TNode GetNodePayload(NodeHandle handle) => _nodes[Resolve(handle)].Payload;
 
     /// <inheritdoc/>
-    public TEdge GetEdgePayload(EdgeHandle handle) => _edges[handle.Index].Payload;
+    public TEdge GetEdgePayload(EdgeHandle handle) => _edges[Resolve(handle)].Payload;
 
     /// <inheritdoc/>
-    public NodeHandle GetSource(EdgeHandle handle) => _edges[handle.Index].Source;
+    public NodeHandle GetSource(EdgeHandle handle) => _edges[Resolve(handle)].Source;
 
     /// <inheritdoc/>
-    public NodeHandle GetTarget(EdgeHandle handle) => _edges[handle.Index].Target;
+    public NodeHandle GetTarget(EdgeHandle handle) => _edges[Resolve(handle)].Target;
+
+    // The guard is resolved eagerly (the Resolve call is an argument, evaluated before the iterator
+    // is built), so an invalid handle throws on the call rather than on deferred enumeration.
+    /// <inheritdoc/>
+    public IEnumerable<EdgeHandle> GetOutEdges(NodeHandle node) => IncidenceOf(Resolve(node), outgoing: true);
 
     /// <inheritdoc/>
-    public IEnumerable<EdgeHandle> GetOutEdges(NodeHandle node) => Incidence(node, outgoing: true);
+    public IEnumerable<EdgeHandle> GetInEdges(NodeHandle node) => IncidenceOf(Resolve(node), outgoing: false);
 
-    /// <inheritdoc/>
-    public IEnumerable<EdgeHandle> GetInEdges(NodeHandle node) => Incidence(node, outgoing: false);
-
-    private IEnumerable<EdgeHandle> Incidence(NodeHandle node, bool outgoing)
+    private IEnumerable<EdgeHandle> IncidenceOf(int index, bool outgoing)
     {
-        if (!TryResolve(node, out int index))
-        {
-            yield break;
-        }
-
         List<int> edges = outgoing ? _nodes[index].OutEdges : _nodes[index].InEdges;
         foreach (int edgeIndex in edges)
         {
@@ -258,14 +271,17 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     /// <inheritdoc/>
     public IEnumerable<EdgeHandle> GetEdges(NodeHandle source, NodeHandle target)
     {
-        // Derived by scanning the source's out-incidence and filtering on target — no dedicated
+        // Both endpoints are guarded (eagerly) so a misused handle fails fast, then edges are
+        // derived by scanning the source's out-incidence and filtering on target — no dedicated
         // (source, target) index (ADR 0002); cheap when sparse.
-        if (!TryResolve(source, out int index))
-        {
-            yield break;
-        }
+        int sourceIndex = Resolve(source);
+        Resolve(target);
+        return EdgesBetween(sourceIndex, target);
+    }
 
-        foreach (int edgeIndex in _nodes[index].OutEdges)
+    private IEnumerable<EdgeHandle> EdgesBetween(int sourceIndex, NodeHandle target)
+    {
+        foreach (int edgeIndex in _nodes[sourceIndex].OutEdges)
         {
             if (_edges[edgeIndex].Target == target)
             {
@@ -275,29 +291,61 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     }
 
     /// <inheritdoc/>
-    public int GetOutDegree(NodeHandle node) => TryResolve(node, out int index) ? _nodes[index].OutEdges.Count : 0;
+    public int GetOutDegree(NodeHandle node) => _nodes[Resolve(node)].OutEdges.Count;
 
     /// <inheritdoc/>
-    public int GetInDegree(NodeHandle node) => TryResolve(node, out int index) ? _nodes[index].InEdges.Count : 0;
+    public int GetInDegree(NodeHandle node) => _nodes[Resolve(node)].InEdges.Count;
 
-    // Resolves a handle to a live slot index, or reports it dead. This is the liveness test that
-    // makes removals idempotent and skips reads over freed slots; the throwing cross-graph /
-    // stale-handle guard (InvalidHandleException) is a later ticket (ADR 0003).
-    private bool TryResolve(NodeHandle handle, out int index)
+    // Throwing guard (ADR 0003): resolves a handle to its live slot index, or fails fast — a handle
+    // from another graph throws CrossGraph, one whose element was removed (its slot freed or reused
+    // by a newer element, told apart by generation) throws Stale. This is what makes handle misuse
+    // surface immediately instead of silently reading the wrong element or returning garbage.
+    private int Resolve(NodeHandle handle)
     {
-        index = handle.Index;
-        return handle.GraphId == _graphId
-            && (uint)index < (uint)_nodeHighWater
+        RequireOwnGraph(handle.GraphId, "node");
+        if (!IsLiveNode(handle))
+        {
+            throw InvalidHandleException.Stale("node");
+        }
+        return handle.Index;
+    }
+
+    private int Resolve(EdgeHandle handle)
+    {
+        RequireOwnGraph(handle.GraphId, "edge");
+        if (!IsLiveEdge(handle))
+        {
+            throw InvalidHandleException.Stale("edge");
+        }
+        return handle.Index;
+    }
+
+    // Non-throwing liveness test used on the removal path, where absence is a normal outcome: it
+    // keeps removals idempotent (a stale same-graph handle is a no-op, not an error). Cross-graph
+    // rejection is handled separately by the caller via RequireOwnGraph before this runs.
+    private bool IsLiveNode(NodeHandle handle)
+    {
+        int index = handle.Index;
+        return (uint)index < (uint)_nodeHighWater
             && _nodes[index].Alive
             && _nodes[index].Generation == handle.Generation;
     }
 
-    private bool TryResolve(EdgeHandle handle, out int index)
+    private bool IsLiveEdge(EdgeHandle handle)
     {
-        index = handle.Index;
-        return handle.GraphId == _graphId
-            && (uint)index < (uint)_edgeHighWater
+        int index = handle.Index;
+        return (uint)index < (uint)_edgeHighWater
             && _edges[index].Alive
             && _edges[index].Generation == handle.Generation;
+    }
+
+    // A default/uninitialised handle carries graph id 0; real graph ids start at 1, so it is
+    // rejected here as not belonging to this graph.
+    private void RequireOwnGraph(int handleGraphId, string element)
+    {
+        if (handleGraphId != _graphId)
+        {
+            throw InvalidHandleException.CrossGraph(element);
+        }
     }
 }

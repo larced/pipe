@@ -6,10 +6,10 @@ namespace GraphLibrary;
 /// dictionary key, independent of the node's payload and unaffected by payload mutation.
 /// </summary>
 /// <remarks>
-/// The value carries an internal slot index plus a generation and a graph stamp. Those
-/// fields exist so a later ticket can add the cross-graph / stale-handle guard (ADR 0003)
-/// without changing this type's shape; the minimal ticket-01 surface only relies on them
-/// for identity. Callers treat the whole value as opaque — no field is public.
+/// The value carries an internal slot index plus a generation and a graph stamp. Together they
+/// are the graph's runtime cross-graph / stale-handle guard (ADR 0003): the graph rejects a handle
+/// whose graph stamp is not its own, or whose generation no longer matches the live slot, throwing
+/// <see cref="InvalidHandleException"/>. Callers treat the whole value as opaque — no field is public.
 /// </remarks>
 public readonly struct NodeHandle : IEquatable<NodeHandle>
 {
