@@ -126,11 +126,18 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     /// re-keys the index; nodes added after this call are not indexed (there is no structural channel).
     /// </remarks>
     public SecondaryIndex<TKey> IndexNodesBy<TKey>(Func<TNode, TKey> keySelector)
+        where TKey : notnull => IndexNodesBy(keySelector, unique: false);
+
+    // Shared seed-and-subscribe machinery behind both the ordinary content index (unique:false) and
+    // the fluent builder's unique keyed index (unique:true, ADR 0006). A unique index rejects a
+    // collision — during the seed below if two present nodes share a key, and later, on the re-key
+    // path, if a SetPayload moves a node onto a key another node holds — throwing DuplicateKeyException.
+    internal SecondaryIndex<TKey> IndexNodesBy<TKey>(Func<TNode, TKey> keySelector, bool unique)
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(keySelector);
 
-        var index = new SecondaryIndex<TKey>();
+        var index = new SecondaryIndex<TKey>(unique);
 
         // Seed from the nodes present at creation. GetNodePayload here is a plain live read.
         foreach (NodeHandle handle in Nodes)
@@ -138,10 +145,11 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
             index.Add(keySelector(GetNodePayload(handle)), handle);
         }
 
-        // Track payload mutation off the change channel: retire the old key and register the new one,
-        // both against the unchanged handle. A mutation that leaves the key untouched is a no-op, so an
-        // off-key payload edit costs the index nothing. The keySelector closure is what keeps TNode off
-        // SecondaryIndex's signature (ADR 0003 — handles and the index stay non-generic in TNode/TEdge).
+        // Track payload mutation off the change channel: move the handle from its old key to its new
+        // one as one collision-checked step (Rekey). A mutation that leaves the key untouched is a
+        // no-op, so an off-key payload edit costs the index nothing. The keySelector closure is what
+        // keeps TNode off SecondaryIndex's signature (ADR 0003 — handles and the index stay
+        // non-generic in TNode/TEdge).
         void OnNodePayloadChanged(PayloadChange<NodeHandle, TNode> change)
         {
             TKey oldKey = keySelector(change.OldPayload);
@@ -150,8 +158,7 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
             {
                 return;
             }
-            index.Remove(oldKey, change.Handle);
-            index.Add(newKey, change.Handle);
+            index.Rekey(oldKey, newKey, change.Handle);
         }
 
         NodePayloadChanged += OnNodePayloadChanged;
@@ -374,6 +381,10 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     /// graph structure is never disturbed — only the payload changes — so this is safe mid-traversal-
     /// planning (ADR 0003, spec story 10). A stale or cross-graph handle is a no-op that broadcasts
     /// nothing; the throwing stale-handle guard (<c>InvalidHandleException</c>) is a later ticket (ADR 0003).
+    /// A subscriber may <em>veto</em> the change by throwing (e.g. a unique
+    /// <see cref="SecondaryIndex{TKey}"/> rejecting a key collision): the payload is rolled back to its
+    /// prior value before the exception propagates, so a rejected mutation leaves the node exactly as
+    /// it was and never desynchronises from an index that refused it.
     /// </summary>
     public void SetPayload(NodeHandle handle, TNode payload)
     {
@@ -385,14 +396,26 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         ref NodeSlot slot = ref _nodes[index];
         TNode old = slot.Payload;
         slot.Payload = payload;
-        NodePayloadChanged?.Invoke(new PayloadChange<NodeHandle, TNode>(handle, old, payload));
+        try
+        {
+            NodePayloadChanged?.Invoke(new PayloadChange<NodeHandle, TNode>(handle, old, payload));
+        }
+        catch
+        {
+            // A subscriber vetoed the change; undo the in-place write so the graph and any index that
+            // rejected it stay in agreement, then let the veto surface.
+            _nodes[index].Payload = old;
+            throw;
+        }
     }
 
     /// <summary>
     /// Replaces the payload of the edge identified by <paramref name="handle"/> in place and
     /// broadcasts the change on <see cref="EdgePayloadChanged"/>. Endpoints and incidence are left
     /// untouched — only the payload changes (ADR 0003, spec story 10). A stale or cross-graph handle
-    /// is a no-op that broadcasts nothing; the throwing guard is a later ticket.
+    /// is a no-op that broadcasts nothing; the throwing guard is a later ticket. As with the node
+    /// overload, a subscriber may veto the change by throwing, in which case the payload is rolled
+    /// back before the exception propagates.
     /// </summary>
     public void SetPayload(EdgeHandle handle, TEdge payload)
     {
@@ -404,7 +427,15 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         ref EdgeSlot slot = ref _edges[index];
         TEdge old = slot.Payload;
         slot.Payload = payload;
-        EdgePayloadChanged?.Invoke(new PayloadChange<EdgeHandle, TEdge>(handle, old, payload));
+        try
+        {
+            EdgePayloadChanged?.Invoke(new PayloadChange<EdgeHandle, TEdge>(handle, old, payload));
+        }
+        catch
+        {
+            _edges[index].Payload = old;
+            throw;
+        }
     }
 
     /// <summary>

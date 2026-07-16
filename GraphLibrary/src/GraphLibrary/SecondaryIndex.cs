@@ -37,9 +37,16 @@ public sealed class SecondaryIndex<TKey> : IDisposable
     // free of the graph's TNode/TEdge parameters — the graph supplies the unsubscribe closure.
     private Action? _detach;
 
+    // When true, a key may map to at most one handle: Add throws DuplicateKeyException on collision.
+    // This is what gates the fluent builder (ADR 0006) — a unique keyed index turns the permissive,
+    // several-handles-per-key default into a one-node-per-key constraint that stays enforced across
+    // later payload mutation. Off for the ordinary content index (several nodes may share a key).
+    private readonly bool _unique;
+
     // Constructed only by Graph.IndexNodesBy, which seeds and wires the change-channel subscription.
-    internal SecondaryIndex()
+    internal SecondaryIndex(bool unique = false)
     {
+        _unique = unique;
     }
 
     /// <summary>
@@ -62,6 +69,8 @@ public sealed class SecondaryIndex<TKey> : IDisposable
     }
 
     // Registers a handle under a key (used to seed existing nodes and to record the new key on re-key).
+    // A unique index rejects a second, distinct handle under a key already in use — the collision the
+    // builder's uniqueness contract exists to catch. Re-adding the same handle is always a no-op.
     internal void Add(TKey key, NodeHandle handle)
     {
         if (!_byKey.TryGetValue(key, out HashSet<NodeHandle>? handles))
@@ -69,8 +78,34 @@ public sealed class SecondaryIndex<TKey> : IDisposable
             handles = new HashSet<NodeHandle>();
             _byKey[key] = handles;
         }
+        if (WouldCollide(key, handle))
+        {
+            throw DuplicateKeyException.ForKey(key);
+        }
         handles.Add(handle);
     }
+
+    // Moves a handle from its old key to its new one as a single step. For a unique index the
+    // destination collision is checked *before* the old key is retired, so a rejected re-key throws
+    // without first mutating the index — leaving it exactly as it was (the old key still resolves).
+    internal void Rekey(TKey oldKey, TKey newKey, NodeHandle handle)
+    {
+        if (WouldCollide(newKey, handle))
+        {
+            throw DuplicateKeyException.ForKey(newKey);
+        }
+        Remove(oldKey, handle);
+        Add(newKey, handle);
+    }
+
+    // Would registering this handle under this key breach the unique-key constraint? True only when
+    // this is a unique index and some *other* handle already holds the key. Re-registering the same
+    // handle is always fine (idempotent), and a non-unique index never collides.
+    private bool WouldCollide(TKey key, NodeHandle handle) =>
+        _unique
+        && _byKey.TryGetValue(key, out HashSet<NodeHandle>? handles)
+        && handles.Count > 0
+        && !handles.Contains(handle);
 
     // Retires a handle from a key, dropping the bucket entirely once empty so a stale key never
     // lingers as an empty entry (keeping Lookup's absent/empty answer honest).
