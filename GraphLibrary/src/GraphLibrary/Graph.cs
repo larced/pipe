@@ -544,32 +544,6 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
             && _edges[index].Generation == handle.Generation;
     }
 
-    // Non-throwing counterpart of Resolve, used on the SetPayload path where a stale or cross-graph
-    // handle is a silent no-op rather than an error (ADR 0003, spec story 10): it folds the
-    // cross-graph and liveness tests into one bool so payload updates never throw. `index` is
-    // meaningful only when the method returns true.
-    private bool TryResolve(NodeHandle handle, out int index)
-    {
-        if (handle.GraphId == _graphId && IsLiveNode(handle))
-        {
-            index = handle.Index;
-            return true;
-        }
-        index = default;
-        return false;
-    }
-
-    private bool TryResolve(EdgeHandle handle, out int index)
-    {
-        if (handle.GraphId == _graphId && IsLiveEdge(handle))
-        {
-            index = handle.Index;
-            return true;
-        }
-        index = default;
-        return false;
-    }
-
     // The uniform mid-iteration failure (spec story 80), mirroring the BCL's wording for a
     // collection mutated during enumeration. Best-effort: it is raised on the enumerating thread
     // when it observes the counter has moved, not a cross-thread safety guarantee (story 82).
