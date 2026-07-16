@@ -55,6 +55,21 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
 
     private const int InitialCapacity = 4;
 
+    /// <summary>
+    /// The observable node-payload change channel (ADR 0002/0003). Fires once per
+    /// <see cref="SetPayload(NodeHandle,TNode)"/> that hits a live node, carrying the handle plus
+    /// its old and new payload — enough for an opt-in secondary index to re-key content without the
+    /// core carrying any content index of its own. Off by default: with no subscriber it costs nothing.
+    /// </summary>
+    public event Action<PayloadChange<NodeHandle, TNode>>? NodePayloadChanged;
+
+    /// <summary>
+    /// The observable edge-payload change channel (ADR 0002/0003). Fires once per
+    /// <see cref="SetPayload(EdgeHandle,TEdge)"/> that hits a live edge, carrying the handle plus its
+    /// old and new payload. The edge counterpart of <see cref="NodePayloadChanged"/>.
+    /// </summary>
+    public event Action<PayloadChange<EdgeHandle, TEdge>>? EdgePayloadChanged;
+
     private struct NodeSlot
     {
         public TNode Payload;
@@ -140,6 +155,45 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         _nodes[targetIndex].InEdges.Add(index);
 
         return new EdgeHandle(index, slot.Generation, _graphId);
+    }
+
+    /// <summary>
+    /// Replaces the payload of the node identified by <paramref name="handle"/> in place and
+    /// broadcasts the change on <see cref="NodePayloadChanged"/>. The handle is never invalidated and
+    /// graph structure is never disturbed — only the payload changes — so this is safe mid-traversal-
+    /// planning (ADR 0003, spec story 10). A stale or cross-graph handle is a no-op that broadcasts
+    /// nothing; the throwing stale-handle guard (<c>InvalidHandleException</c>) is a later ticket (ADR 0003).
+    /// </summary>
+    public void SetPayload(NodeHandle handle, TNode payload)
+    {
+        if (!TryResolve(handle, out int index))
+        {
+            return;
+        }
+
+        ref NodeSlot slot = ref _nodes[index];
+        TNode old = slot.Payload;
+        slot.Payload = payload;
+        NodePayloadChanged?.Invoke(new PayloadChange<NodeHandle, TNode>(handle, old, payload));
+    }
+
+    /// <summary>
+    /// Replaces the payload of the edge identified by <paramref name="handle"/> in place and
+    /// broadcasts the change on <see cref="EdgePayloadChanged"/>. Endpoints and incidence are left
+    /// untouched — only the payload changes (ADR 0003, spec story 10). A stale or cross-graph handle
+    /// is a no-op that broadcasts nothing; the throwing guard is a later ticket.
+    /// </summary>
+    public void SetPayload(EdgeHandle handle, TEdge payload)
+    {
+        if (!TryResolve(handle, out int index))
+        {
+            return;
+        }
+
+        ref EdgeSlot slot = ref _edges[index];
+        TEdge old = slot.Payload;
+        slot.Payload = payload;
+        EdgePayloadChanged?.Invoke(new PayloadChange<EdgeHandle, TEdge>(handle, old, payload));
     }
 
     /// <summary>
