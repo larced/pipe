@@ -87,6 +87,13 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     // contract is caller-synchronized writes (story 78).
     private int _structuralVersion;
 
+    // The topology Validators this graph enforces (ticket 07 / #18, spec stories 16–19). Off by
+    // default (None) — the core holds any topology; a validator is opt-in policy layered on top,
+    // kept separate from the store's structural capability. Independently composable via the
+    // [Flags] enum, and checked at mutation time on the AddEdge path only (node adds and payload
+    // edits never change topology). A caller opts in through AddValidator.
+    private TopologyValidator _validators;
+
     private const int InitialCapacity = 4;
 
     /// <summary>
@@ -152,6 +159,122 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         return index;
     }
 
+    /// <summary>
+    /// The topology <see cref="TopologyValidator"/>s this graph currently enforces — a bitwise
+    /// combination, <see cref="TopologyValidator.None"/> when the permissive default has never been
+    /// narrowed (spec story 19). Read-only introspection of the policy set by <see cref="AddValidator"/>.
+    /// </summary>
+    public TopologyValidator Validators => _validators;
+
+    /// <summary>
+    /// Opts this graph into enforcing the topology <paramref name="validators"/> from now on — a
+    /// self-loop, parallel-edge, or cycle-closing mutation that would violate an enabled validator is
+    /// rejected at mutation time with <see cref="ValidatorRejectedException"/> (CONTEXT.md → Validator,
+    /// spec stories 16–19). Cumulative and idempotent: the flags OR into whatever is already enforced,
+    /// so several calls compose and re-adding one changes nothing.
+    /// </summary>
+    /// <remarks>
+    /// So a graph never claims a topology it does not actually hold, this first verifies the
+    /// <em>current</em> graph already satisfies each newly-added validator and throws
+    /// <see cref="ValidatorRejectedException"/> (leaving the policy unchanged) if it does not — enable
+    /// the validator before adding the topology it forbids. The acyclicity check runs the internal
+    /// cycle-detection utility (<see cref="Topology.ContainsCycle"/>) that ticket 12 later surfaces as a
+    /// public advisory query.
+    /// </remarks>
+    public void AddValidator(TopologyValidator validators)
+    {
+        // Verify the standing graph before committing the policy — a validator must never be claimed
+        // over a graph that already breaks it. Each check covers only its own topology (composability).
+        if ((validators & TopologyValidator.NoSelfLoops) != 0 && HasAnySelfLoop())
+        {
+            throw ValidatorRejectedException.AlreadyViolated(TopologyValidator.NoSelfLoops);
+        }
+        if ((validators & TopologyValidator.SimpleGraph) != 0 && HasAnyParallelEdge())
+        {
+            throw ValidatorRejectedException.AlreadyViolated(TopologyValidator.SimpleGraph);
+        }
+        if ((validators & TopologyValidator.Acyclic) != 0 && Topology.ContainsCycle(this))
+        {
+            throw ValidatorRejectedException.AlreadyViolated(TopologyValidator.Acyclic);
+        }
+
+        _validators |= validators;
+    }
+
+    // Rejects an edge source→target that an enabled validator forbids, before any slot is touched, so
+    // a rejected mutation leaves the graph — incidence, degree, structural version — entirely intact.
+    // Endpoints are already resolved to live handles by the caller. Checks are independent: each
+    // validator inspects only its own topology, and disabled ones cost nothing.
+    private void RejectIfValidatorForbids(NodeHandle source, NodeHandle target)
+    {
+        if (_validators == TopologyValidator.None)
+        {
+            return;
+        }
+
+        if ((_validators & TopologyValidator.NoSelfLoops) != 0 && source == target)
+        {
+            throw ValidatorRejectedException.SelfLoop();
+        }
+        if ((_validators & TopologyValidator.SimpleGraph) != 0 && HasEdgeBetween(source, target))
+        {
+            throw ValidatorRejectedException.ParallelEdge();
+        }
+        if ((_validators & TopologyValidator.Acyclic) != 0 && Topology.WouldCreateCycle(this, source, target))
+        {
+            throw ValidatorRejectedException.Cycle();
+        }
+    }
+
+    // Is there already an edge on the ordered pair source→target? A direct scan of the source's
+    // out-incidence (no dedicated pair index, ADR 0002); source is a resolved live handle.
+    private bool HasEdgeBetween(NodeHandle source, NodeHandle target)
+    {
+        foreach (int edgeIndex in _nodes[source.Index].OutEdges)
+        {
+            if (_edges[edgeIndex].Target == target)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Retro-check for AddValidator(NoSelfLoops): any live edge whose endpoints coincide.
+    private bool HasAnySelfLoop()
+    {
+        for (int i = 0; i < _edgeHighWater; i++)
+        {
+            if (_edges[i].Alive && _edges[i].Source == _edges[i].Target)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Retro-check for AddValidator(SimpleGraph): any node with two out-edges to the same target.
+    private bool HasAnyParallelEdge()
+    {
+        var targets = new HashSet<NodeHandle>();
+        for (int i = 0; i < _nodeHighWater; i++)
+        {
+            if (!_nodes[i].Alive)
+            {
+                continue;
+            }
+            targets.Clear();
+            foreach (int edgeIndex in _nodes[i].OutEdges)
+            {
+                if (!targets.Add(_edges[edgeIndex].Target))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private struct NodeSlot
     {
         public TNode Payload;
@@ -212,6 +335,10 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
         // otherwise corrupt incidence by aliasing an unrelated (or freed) slot. Fail fast (ADR 0003).
         int sourceIndex = Resolve(source);
         int targetIndex = Resolve(target);
+
+        // Enforce opt-in topology Validators before touching any slot, so a rejected edge leaves the
+        // graph exactly as it was (ticket 07 / #18). No-op when nothing is opted in.
+        RejectIfValidatorForbids(source, target);
 
         int index;
         if (_freeEdgeSlots.Count > 0)
