@@ -70,6 +70,54 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
     /// </summary>
     public event Action<PayloadChange<EdgeHandle, TEdge>>? EdgePayloadChanged;
 
+    /// <summary>
+    /// Creates an opt-in <see cref="SecondaryIndex{TKey}"/> mapping the key
+    /// <paramref name="keySelector"/> derives from each node's payload back to that node's handle,
+    /// for content-based lookup (CONTEXT.md → Secondary index, spec stories 42-44). The index is
+    /// seeded from the nodes present now and then kept correct across payload mutation by subscribing
+    /// to <see cref="NodePayloadChanged"/> — so content lookups never go stale as payloads change.
+    /// </summary>
+    /// <remarks>
+    /// Off by default and not part of core identity (ADR 0003): the core holds no content index, so a
+    /// graph you never call this on stays lean and domain-agnostic (story 44). Call it once per key you
+    /// want to look up by; several independent indexes over one graph are each maintained. Dispose the
+    /// returned index to detach it from the channel when you no longer need it. Only <c>SetPayload</c>
+    /// re-keys the index; nodes added after this call are not indexed (there is no structural channel).
+    /// </remarks>
+    public SecondaryIndex<TKey> IndexNodesBy<TKey>(Func<TNode, TKey> keySelector)
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(keySelector);
+
+        var index = new SecondaryIndex<TKey>();
+
+        // Seed from the nodes present at creation. GetNodePayload here is a plain live read.
+        foreach (NodeHandle handle in Nodes)
+        {
+            index.Add(keySelector(GetNodePayload(handle)), handle);
+        }
+
+        // Track payload mutation off the change channel: retire the old key and register the new one,
+        // both against the unchanged handle. A mutation that leaves the key untouched is a no-op, so an
+        // off-key payload edit costs the index nothing. The keySelector closure is what keeps TNode off
+        // SecondaryIndex's signature (ADR 0003 — handles and the index stay non-generic in TNode/TEdge).
+        void OnNodePayloadChanged(PayloadChange<NodeHandle, TNode> change)
+        {
+            TKey oldKey = keySelector(change.OldPayload);
+            TKey newKey = keySelector(change.NewPayload);
+            if (EqualityComparer<TKey>.Default.Equals(oldKey, newKey))
+            {
+                return;
+            }
+            index.Remove(oldKey, change.Handle);
+            index.Add(newKey, change.Handle);
+        }
+
+        NodePayloadChanged += OnNodePayloadChanged;
+        index.SetDetach(() => NodePayloadChanged -= OnNodePayloadChanged);
+        return index;
+    }
+
     private struct NodeSlot
     {
         public TNode Payload;
@@ -372,6 +420,32 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
             throw InvalidHandleException.Stale("edge");
         }
         return handle.Index;
+    }
+
+    // Non-throwing resolve used on the SetPayload path (ticket 04), where a stale or cross-graph
+    // handle is a silent no-op rather than an error — payload mutation broadcasts nothing when it
+    // hits nothing. The throwing Resolve above is for read/incidence members; this is its lenient
+    // sibling. Returns false (index unset) unless the handle is a live node of this graph.
+    private bool TryResolve(NodeHandle handle, out int index)
+    {
+        if (handle.GraphId == _graphId && IsLiveNode(handle))
+        {
+            index = handle.Index;
+            return true;
+        }
+        index = 0;
+        return false;
+    }
+
+    private bool TryResolve(EdgeHandle handle, out int index)
+    {
+        if (handle.GraphId == _graphId && IsLiveEdge(handle))
+        {
+            index = handle.Index;
+            return true;
+        }
+        index = 0;
+        return false;
     }
 
     // Non-throwing liveness test used on the removal path, where absence is a normal outcome: it
