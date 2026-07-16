@@ -55,7 +55,7 @@ namespace GraphLibrary;
 /// over this core — which is why the core carries no lock to remove.
 /// </para>
 /// </remarks>
-public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
+public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>, IStructurallyVersioned
 {
     // Distinct id per graph instance, stamped into every handle this graph mints so RequireOwnGraph
     // can reject a handle used against the wrong graph. Starts at 1 (Interlocked.Increment from 0),
@@ -701,6 +701,11 @@ public sealed class Graph<TNode, TEdge> : IReadableGraph<TNode, TEdge>
             && _edges[index].Alive
             && _edges[index].Generation == handle.Generation;
     }
+
+    // Exposes ticket 06's structural-version counter to the layered Traversal API (ADR 0004) via
+    // the internal seam only — explicit implementation keeps it off Graph's public surface, so the
+    // plain graph a non-traversal caller sees is unchanged (spec story 41). A pure read.
+    int IStructurallyVersioned.StructuralVersion => _structuralVersion;
 
     // The uniform mid-iteration failure (spec story 80), mirroring the BCL's wording for a
     // collection mutated during enumeration. Best-effort: it is raised on the enumerating thread
