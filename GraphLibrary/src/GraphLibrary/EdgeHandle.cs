@@ -8,7 +8,8 @@ namespace GraphLibrary;
 /// </summary>
 /// <remarks>
 /// Shape mirrors <see cref="NodeHandle"/>: an internal slot index plus generation and graph
-/// stamps reserved for the later cross-graph / stale-handle guard (ADR 0003). Opaque to callers.
+/// stamps that drive the graph's cross-graph / stale-handle guard (ADR 0003) — a foreign or stale
+/// edge handle throws <see cref="InvalidHandleException"/>. Opaque to callers.
 /// </remarks>
 public readonly struct EdgeHandle : IEquatable<EdgeHandle>
 {
