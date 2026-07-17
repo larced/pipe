@@ -2,10 +2,11 @@ namespace GraphLibrary;
 
 /// <summary>
 /// The internal cycle-detection utility over the lean <see cref="IReadableGraph{TNode,TEdge}"/>
-/// read surface (ADR 0001): it answers "does this graph contain a cycle?" and "would adding
-/// <c>source→target</c> create one?" without mutating anything. Consumed by the acyclicity
-/// <see cref="TopologyValidator"/> here, and surfaced as public advisory queries in ticket 12
-/// (spec story 20) — the same primitive, exposed once the advisory namespace lands.
+/// read surface (ADR 0001): it answers "does this graph contain a cycle?", "which edge-paths close
+/// a cycle?", and "would adding <c>source→target</c> create one?" without mutating anything.
+/// Consumed by the acyclicity <see cref="TopologyValidator"/> here, and surfaced as the public
+/// advisory <c>Cycles</c> queries in ticket 12 (spec story 20) — the same primitive, exposed once
+/// the advisory namespace lands.
 /// </summary>
 /// <remarks>
 /// Both walks are iterative with an explicit stack rather than recursive: the target scale is
@@ -73,6 +74,64 @@ internal static class Topology
     }
 
     /// <summary>
+    /// A witness set of cycles in <paramref name="graph"/>: for every back edge the three-colour DFS
+    /// meets, the closed edge-path it completes, from the re-entered node back to itself (a self-loop
+    /// is a length-one cycle). This is not the exponential enumeration of <em>all</em> elementary
+    /// cycles — it is a bounded diagnostic set (at most one cycle per back edge) that is non-empty iff
+    /// <see cref="ContainsCycle{TNode,TEdge}"/> is true, and that touches every cyclic region.
+    /// </summary>
+    public static IReadOnlyList<EdgeHandle[]> FindCycles<TNode, TEdge>(IReadableGraph<TNode, TEdge> graph)
+    {
+        var state = new Dictionary<NodeHandle, NodeState>();
+        // Each frame carries the edge that entered its node (default for a DFS root, never read there), so
+        // a back edge can reconstruct the active-path segment it closes. The enumerator is a reference, so
+        // advancing it through the peeked copy drives the one shared cursor (as in ContainsCycle).
+        var stack = new Stack<(NodeHandle Node, EdgeHandle EntryEdge, IEnumerator<EdgeHandle> OutEdges)>();
+        var cycles = new List<EdgeHandle[]>();
+
+        foreach (NodeHandle start in graph.Nodes)
+        {
+            if (state.GetValueOrDefault(start) != NodeState.Unseen)
+            {
+                continue;
+            }
+
+            state[start] = NodeState.InProgress;
+            stack.Push((start, default, graph.GetOutEdges(start).GetEnumerator()));
+
+            while (stack.Count > 0)
+            {
+                (NodeHandle node, _, IEnumerator<EdgeHandle> outEdges) = stack.Peek();
+                if (outEdges.MoveNext())
+                {
+                    EdgeHandle edge = outEdges.Current;
+                    NodeHandle next = graph.GetTarget(edge);
+                    switch (state.GetValueOrDefault(next))
+                    {
+                        case NodeState.InProgress:
+                            // Back edge to a node still on the active path — reconstruct its cycle.
+                            cycles.Add(ReconstructCycle(stack, next, edge));
+                            break;
+                        case NodeState.Unseen:
+                            state[next] = NodeState.InProgress;
+                            stack.Push((next, edge, graph.GetOutEdges(next).GetEnumerator()));
+                            break;
+                        // Done: already fully explored, no active-path cycle through it — skip.
+                    }
+                }
+                else
+                {
+                    state[node] = NodeState.Done;
+                    outEdges.Dispose();
+                    stack.Pop();
+                }
+            }
+        }
+
+        return cycles;
+    }
+
+    /// <summary>
     /// Would adding an edge <paramref name="source"/>→<paramref name="target"/> introduce a cycle,
     /// given <paramref name="graph"/> as it is now? True iff the endpoints coincide (a self-loop is a
     /// trivial cycle) or <paramref name="target"/> already reaches <paramref name="source"/>, so the
@@ -109,6 +168,29 @@ internal static class Topology
         }
 
         return false;
+    }
+
+    // Rebuilds the cycle a back edge closes: the entry edges of every active-path frame above `next`
+    // (top→bottom), reversed into next→…→node order, then the closing back edge that returns to `next`.
+    // A self-loop re-enters the top frame, so no entry edges are collected and the result is just the
+    // closing edge.
+    private static EdgeHandle[] ReconstructCycle(
+        Stack<(NodeHandle Node, EdgeHandle EntryEdge, IEnumerator<EdgeHandle> OutEdges)> stack,
+        NodeHandle next,
+        EdgeHandle closingEdge)
+    {
+        var edges = new List<EdgeHandle>();
+        foreach ((NodeHandle node, EdgeHandle entryEdge, _) in stack) // top → bottom
+        {
+            if (node == next)
+            {
+                break; // reached the re-entered node; its own entry edge is outside the cycle
+            }
+            edges.Add(entryEdge);
+        }
+        edges.Reverse();
+        edges.Add(closingEdge);
+        return edges.ToArray();
     }
 
     private static void DisposeAll(Stack<(NodeHandle Node, IEnumerator<EdgeHandle> OutEdges)> stack)
