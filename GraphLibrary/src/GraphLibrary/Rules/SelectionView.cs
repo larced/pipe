@@ -36,13 +36,29 @@ public sealed class SelectionView<TNode, TEdge, TInstanceData>
     /// the constructor is public so a rule author can unit-test a custom rule against a hand-built view.
     /// </summary>
     public SelectionView(IReadableGraph<TNode, TEdge> graph, Selection<TInstanceData> selection)
+        : this(graph, NotNull(selection).Instances)
+    {
+    }
+
+    // Builds a view over an explicit instance sequence rather than a live selection. Internal because
+    // it is the substrate Availability uses to snapshot "the current selection plus a hypothetical
+    // candidate occurrence" without ever mutating the caller's Selection (ADR 0005: Check/Availability
+    // cannot mutate). The supplied instances must have distinct ids — the caller mints synthetic ids
+    // that cannot collide with a real selection's (a stamp no selection ever mints).
+    internal SelectionView(IReadableGraph<TNode, TEdge> graph, IEnumerable<Instance<TInstanceData>> instances)
     {
         ArgumentNullException.ThrowIfNull(graph);
-        ArgumentNullException.ThrowIfNull(selection);
+        ArgumentNullException.ThrowIfNull(instances);
 
         Graph = graph;
-        _instances = [.. selection.Instances];
+        _instances = [.. instances];
         _regionOf = _instances.ToDictionary(i => i.Id, i => i.Region);
+    }
+
+    private static Selection<TInstanceData> NotNull(Selection<TInstanceData> selection)
+    {
+        ArgumentNullException.ThrowIfNull(selection);
+        return selection;
     }
 
     /// <summary>
