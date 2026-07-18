@@ -40,4 +40,21 @@ public static class Evaluator
 
         return violations;
     }
+
+    /// <summary>
+    /// Builds a <see cref="RuleIndex{TNode,TEdge,TInstanceData}"/> over <paramref name="rules"/>,
+    /// bucketing each built-in by the prototype handles it declares (<see cref="IHandleReferencing"/>)
+    /// and treating every other rule as always relevant. The index is what keeps a later Availability
+    /// derivation off <c>O(candidates × allRules)</c> — it re-Checks only the rules a given candidate's
+    /// prototype could affect, not the whole set (ADR 0005). It changes no verdict: a full
+    /// <see cref="Check{TNode,TEdge,TInstanceData}"/> and an index-pruned evaluation report the same
+    /// violations.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="rules"/> or any rule is null.</exception>
+    public static RuleIndex<TNode, TEdge, TInstanceData> Index<TNode, TEdge, TInstanceData>(
+        IEnumerable<IRule<TNode, TEdge, TInstanceData>> rules)
+    {
+        ArgumentNullException.ThrowIfNull(rules);
+        return new RuleIndex<TNode, TEdge, TInstanceData>(rules);
+    }
 }
